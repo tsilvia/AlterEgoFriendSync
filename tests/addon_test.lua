@@ -1109,8 +1109,8 @@ local function test_protocol_sync_all_shares_refresh_build()
     }
   end
 
-  -- online#2 was offline at the last refresh, so RefreshFriends sends it an
-  -- INDEX before SyncAll sends one to every online friend.
+  -- online#2 was offline at the last refresh; SyncAll must still send it
+  -- exactly one INDEX.
   savedFriends["online#2"].online = false
   lockedDown = false
   resetProtocolCounters()
@@ -1119,8 +1119,23 @@ local function test_protocol_sync_all_shares_refresh_build()
   table.sort(sentIndexTo)
   check(
     "protocol/sync-all-refresh",
-    #sentIndexTo == 3 and sentIndexTo[1] == "online#1" and sentIndexTo[2] == "online#2" and sentIndexTo[3] == "online#2",
-    "SyncAll did not index the newly online friend from both RefreshFriends and SyncAll"
+    #sentIndexTo == 2 and sentIndexTo[1] == "online#1" and sentIndexTo[2] == "online#2",
+    "SyncAll did not send exactly one INDEX to each online friend"
+  )
+
+  -- Tick/login pass: RefreshFriends(skipIndex) then CheckForChanges(true).
+  -- SyncAll replaced protocol.friendsByBattleTag, so edit the current table.
+  protocol.friendsByBattleTag["online#2"].online = false
+  resetProtocolCounters()
+  protocol:RefreshFriends(false, true)
+  protocol:CheckForChanges(true)
+  protocol:FlushPending()
+  check("protocol/tick-refresh", buildOwnCalls == 1, "tick with a newly online friend ran BuildOwn " .. buildOwnCalls .. " times")
+  table.sort(sentIndexTo)
+  check(
+    "protocol/tick-refresh",
+    #sentIndexTo == 2 and sentIndexTo[1] == "online#1" and sentIndexTo[2] == "online#2",
+    "tick did not send exactly one INDEX to each online friend"
   )
 
   BNET_CLIENT_WOW = nil
