@@ -1,0 +1,8 @@
+{
+  "name": "alterego-friend-sync",
+  "private": true,
+  "description": "Dev-only script runner; the addon itself has no Node dependencies.",
+  "scripts": {
+    "test": "node tests/run.js"
+  }
+}

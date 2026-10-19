@@ -1149,6 +1149,97 @@ local function test_protocol_sync_all_shares_refresh_build()
   protocol.friendsByCharacter = {}
 end
 
+local function test_protocol_requested_data_builds_only_requested()
+  local protocol = addon.Protocol
+  local characters = AlterEgoDB.global.characters
+  local originalGuids = {}
+  for guid in pairs(characters) do
+    originalGuids[guid] = true
+  end
+  for i = 2, 4 do
+    local copy = addon.Util:CopySerializable(characters["Player-1"])
+    copy.GUID = "Player-" .. i
+    characters[copy.GUID] = copy
+  end
+  addon.db.injected["Player-4"] = "friend#1234"
+
+  local trimmed = {}
+  local nows = {}
+  local trim = addon.Snapshot.Trim
+  addon.Snapshot.Trim = function(self, character, now, ...)
+    trimmed[#trimmed + 1] = character and character.GUID
+    nows[#nows + 1] = now
+    return trim(self, character, now, ...)
+  end
+  local dataBody, dataPriority
+  local send = addon.Transport.Send
+  addon.Transport.Send = function(_, _, kind, body, priority)
+    if kind == "DATA" then
+      dataBody, dataPriority = body, priority
+    end
+    return true
+  end
+
+  local function count(t)
+    local n = 0
+    for _ in pairs(t) do
+      n = n + 1
+    end
+    return n
+  end
+
+  local peer = addon.db.peers["online#1"]
+  resetProtocolCounters()
+  protocol:SendRequestedData(peer, {"Player-2", "Player-2", "Player-4", "Player-missing", 42})
+  check("protocol/req-subset", #trimmed == 1 and trimmed[1] == "Player-2", "REQ trimmed " .. #trimmed .. " characters")
+  check("protocol/req-subset", dataBody ~= nil, "no DATA message was sent")
+  check("protocol/req-subset", dataPriority == "BULK", "DATA was not sent at BULK priority")
+  check("protocol/req-subset", type(nows[1]) == "number", "Trim did not receive the hidden-lockout cutoff")
+  check(
+    "protocol/req-subset",
+    count(dataBody.records) == 1 and dataBody.records["Player-2"],
+    "DATA did not contain exactly the requested own record"
+  )
+  check(
+    "protocol/req-subset",
+    dataBody.fingerprints["Player-2"] == addon.Snapshot:Fingerprint(dataBody.records["Player-2"])
+      and count(dataBody.fingerprints) == 1,
+    "DATA fingerprints do not match the requested records"
+  )
+  check("protocol/req-subset", dataBody.records["Player-4"] == nil, "injected friend character was sent")
+
+  trimmed, dataBody = {}, nil
+  protocol:SendRequestedData(peer, {})
+  check("protocol/req-empty", dataBody ~= nil, "empty REQ sent no DATA message")
+  check(
+    "protocol/req-empty",
+    #trimmed == 0 and count(dataBody.records) == 0,
+    "empty REQ should send empty DATA without building"
+  )
+
+  trimmed, dataBody = {}, nil
+  local many = {}
+  for i = 1, 300 do
+    many[i] = "Player-x" .. i
+    characters[many[i]] = addon.Util:CopySerializable(characters["Player-1"])
+    characters[many[i]].GUID = many[i]
+  end
+  protocol:SendRequestedData(peer, many)
+  check("protocol/req-cap", dataBody ~= nil, "large REQ sent no DATA message")
+  check("protocol/req-cap", count(dataBody.records) == 200 and #trimmed == 200, "REQ cap of 200 not enforced")
+
+  addon.Snapshot.Trim = trim
+  addon.Transport.Send = send
+  addon.db.injected = {}
+  for guid in pairs(characters) do
+    if not originalGuids[guid] then
+      characters[guid] = nil
+    end
+  end
+
+  check("snapshot/build-own-type", not pcall(addon.Snapshot.BuildOwn, addon.Snapshot, "Player-1"), "non-table wanted accepted")
+end
+
 --------------------------------------------------------------------------------
 -- Runner
 --------------------------------------------------------------------------------
@@ -1183,5 +1274,6 @@ test_protocol_batch_shares_encode_cache()
 test_protocol_flush_builds_once()
 test_protocol_broadcast_builds_once()
 test_protocol_sync_all_shares_refresh_build()
+test_protocol_requested_data_builds_only_requested()
 
 print("AlterEgoFriend data, transport, and protocol tests passed.")
