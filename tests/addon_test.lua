@@ -198,6 +198,466 @@ local function test_snapshot_fingerprint()
   )
 end
 
+-- The released 1.1.1 Snapshot module, loaded into its own addon table so it runs
+-- exactly as a 1.x client would. Util.lua is unchanged since 1.1.1.
+local legacyAddon = {}
+assert(loadfile("Util.lua"), "missing Util.lua")("AlterEgoFriendSync", legacyAddon)
+assert(loadfile("tests/legacy/Snapshot_1_1_1.lua"), "missing tests/legacy/Snapshot_1_1_1.lua")(
+  "AlterEgoFriendSync",
+  legacyAddon
+)
+local LegacySnapshot = legacyAddon.Snapshot
+
+-- The 1.x Fingerprint, which 1.x receivers still use to verify our records.
+local function legacyFingerprint(record)
+  return LegacySnapshot:Fingerprint(record)
+end
+
+local function filled(count, make)
+  local result = {}
+  for index = 1, count do
+    result[index] = make(index)
+  end
+  return result
+end
+
+-- Every array at its Trim limit, far over the record node cap.
+local function buildMaxCharacter(questIDOrder)
+  local questsCompleted = {}
+  for _, questID in ipairs(questIDOrder or filled(150, function(index) return 90000 + index end)) do
+    questsCompleted[questID] = questID % 2 == 0
+  end
+  return {
+    GUID = "Player-Max",
+    lastUpdate = 100,
+    order = 3,
+    currentSeason = 1,
+    currentSeasonID = 15,
+    info = {name = "Max", realm = "Realm", level = 80},
+    mythicplus = {
+      rating = 3000,
+      runHistory = filled(200, function(index)
+        return {thisWeek = true, level = index, mapChallengeModeID = index}
+      end),
+      dungeons = filled(50, function(index)
+        return {
+          challengeModeID = index,
+          bestTimedRun = {},
+          bestNotTimedRun = {},
+          affixScores = filled(10, function(affix) return {id = affix, name = "Affix", score = affix} end),
+        }
+      end),
+    },
+    vault = {
+      slots = filled(20, function(index) return {id = index, index = index} end),
+      activityEncounterInfo = filled(100, function(index) return {index = index} end),
+      worldActivityProgress = filled(50, function(index) return {activityTierID = index} end),
+    },
+    raids = {
+      savedInstances = filled(100, function(index)
+        return {
+          id = index,
+          name = "Raid",
+          encounters = filled(100, function(encounter) return {index = encounter, bossName = "Boss"} end),
+        }
+      end),
+    },
+    currencies = filled(100, function(index) return {id = index, name = "Currency"} end),
+    prey = {questsCompleted = questsCompleted},
+    equipment = filled(20, function(index) return {itemName = "Item", itemSlotID = index} end),
+  }
+end
+
+local function copiedNodeCount(record)
+  local state = {seen = {}, count = 0}
+  addon.Util:CopySerializable(record, state)
+  return state.count
+end
+
+local function test_snapshot_fingerprint_matches_legacy()
+  local normal = addon.Snapshot:Trim(AlterEgoDB.global.characters["Player-1"])
+  check(
+    "snapshot/fingerprint-legacy",
+    addon.Snapshot:Fingerprint(normal) == legacyFingerprint(normal),
+    "normal record fingerprint differs from 1.x"
+  )
+
+  local maximum = addon.Snapshot:Trim(buildMaxCharacter())
+  check(
+    "snapshot/trim-cap",
+    copiedNodeCount(maximum) <= 10000,
+    "maximum record has " .. copiedNodeCount(maximum) .. " nodes"
+  )
+  check(
+    "snapshot/trim-cap",
+    #maximum.raids.savedInstances < 100 and #maximum.mythicplus.dungeons == 50,
+    "cap did not drop raid lockouts first"
+  )
+  check(
+    "snapshot/fingerprint-legacy",
+    addon.Snapshot:Fingerprint(maximum) == legacyFingerprint(maximum),
+    "maximum record fingerprint differs from 1.x"
+  )
+end
+
+-- A record in Trim's output shape with exactly `target` nodes, as a 1.x sender would
+-- produce it. Built without calling Trim on the result so the cap cannot shrink it:
+-- 10-boss raid lockouts (67 nodes each) plus prey quests (1 node each) to land exactly.
+local function buildRecordWithNodes(target)
+  local base = buildMaxCharacter()
+  base.raids.savedInstances = {}
+  base.prey.questsCompleted = {}
+  local record = addon.Snapshot:Trim(base)
+  local remaining = target - copiedNodeCount(record)
+  local lockoutNodes = 7 + 6 * 10
+  local lockouts = math.floor(remaining / lockoutNodes)
+  assert(lockouts <= 100, "fixture needs more raid lockouts than Trim keeps")
+  record.raids.savedInstances = filled(lockouts, function(index)
+    return {
+      id = index,
+      name = "Raid",
+      instanceID = index,
+      difficultyID = 16,
+      expires = 0,
+      encounters = filled(10, function(encounter)
+        return {index = encounter, instanceEncounterID = 0, bossName = "Boss", fileDataID = 0, isKilled = true}
+      end),
+    }
+  end)
+  for questID = 1, remaining - lockouts * lockoutNodes do
+    record.prey.questsCompleted[90000 + questID] = true
+  end
+  return record, lockouts
+end
+
+local function test_snapshot_trim_cap_boundary()
+  local atCap, atCapLockouts = buildRecordWithNodes(10000)
+  local record = addon.Snapshot:Trim(atCap)
+  check("snapshot/cap-boundary", copiedNodeCount(record) == 10000, "fixture is not exactly 10,000 nodes")
+  check(
+    "snapshot/cap-boundary",
+    #record.raids.savedInstances == atCapLockouts,
+    "a 10,000-node record was trimmed"
+  )
+  check(
+    "snapshot/cap-boundary",
+    addon.Snapshot:Fingerprint(record) == legacyFingerprint(record),
+    "a 10,000-node record fingerprints differently from 1.x"
+  )
+
+  local overCap, overCapLockouts = buildRecordWithNodes(10001)
+  local capped = addon.Snapshot:Trim(overCap)
+  check(
+    "snapshot/cap-boundary",
+    copiedNodeCount(capped) <= 10000 and #capped.raids.savedInstances == overCapLockouts - 1,
+    "a 10,001-node record did not drop exactly its last raid lockout"
+  )
+  check(
+    "snapshot/cap-boundary",
+    addon.Snapshot:Fingerprint(capped) == legacyFingerprint(capped),
+    "a capped record fingerprints differently from 1.x"
+  )
+end
+
+-- 1.x senders under 10,000 nodes verify today, so a new receiver must not trim them.
+local function test_snapshot_legacy_sender_verifies()
+  for _, target in ipairs({8001, 9000, 10000}) do
+    local sent = buildRecordWithNodes(target)
+    check(
+      "snapshot/legacy-sender",
+      copiedNodeCount(sent) == target,
+      "fixture is not exactly " .. target .. " nodes"
+    )
+    local senderFingerprint = legacyFingerprint(sent)
+    local received = addon.Util:CopySerializable(sent)
+    check(
+      "snapshot/legacy-sender",
+      addon.Snapshot:Fingerprint(addon.Snapshot:Trim(received)) == senderFingerprint,
+      "a " .. target .. "-node record from a 1.x sender failed to verify"
+    )
+  end
+end
+
+local function test_snapshot_trim_idempotent()
+  local serialize = function(record) return addon.Snapshot:SerializeStable(record) end
+  for _, character in ipairs({AlterEgoDB.global.characters["Player-1"], buildMaxCharacter()}) do
+    local once = addon.Snapshot:Trim(character)
+    check(
+      "snapshot/trim-idempotent",
+      serialize(addon.Snapshot:Trim(once)) == serialize(once),
+      "Trim(Trim(x)) differs from Trim(x) for " .. character.GUID
+    )
+  end
+end
+
+local function test_snapshot_trim_deterministic()
+  local ascending = filled(150, function(index) return 90000 + index end)
+  local descending = filled(150, function(index) return 90151 - index end)
+  local first = addon.Snapshot:Trim(buildMaxCharacter(ascending))
+  local second = addon.Snapshot:Trim(buildMaxCharacter(descending))
+  check(
+    "snapshot/trim-deterministic",
+    addon.Snapshot:SerializeStable(first) == addon.Snapshot:SerializeStable(second),
+    "insertion order changed the trimmed record"
+  )
+  check(
+    "snapshot/trim-prey",
+    addon.Util:Count(first.prey.questsCompleted) == 100
+      and first.prey.questsCompleted[90100] ~= nil
+      and first.prey.questsCompleted[90101] == nil,
+    "prey did not keep the 100 lowest quest IDs"
+  )
+end
+
+local function test_snapshot_run_history_keeps_newest()
+  local character = buildMaxCharacter()
+  character.mythicplus.runHistory = filled(250, function(index)
+    return {thisWeek = index > 245, level = index, mapChallengeModeID = 1}
+  end)
+  local record = addon.Snapshot:Trim(character)
+  local runs = record.mythicplus.runHistory
+  local thisWeek = 0
+  for _, run in ipairs(runs) do
+    if run.thisWeek then thisWeek = thisWeek + 1 end
+  end
+  check(
+    "snapshot/run-history",
+    #runs == 200 and runs[1].level == 51 and runs[200].level == 250 and thisWeek == 5,
+    "run history did not keep the newest 200 runs"
+  )
+  check(
+    "snapshot/run-history",
+    addon.Snapshot:SerializeStable(addon.Snapshot:Trim(record)) == addon.Snapshot:SerializeStable(record),
+    "re-trimming the newest 200 runs changed them"
+  )
+end
+
+-- The cap only cuts raid lockouts, which relies on everything else fitting at its limits.
+local function test_snapshot_non_raid_maximum_fits_cap()
+  local character = buildMaxCharacter()
+  character.raids.savedInstances = {}
+  local record = addon.Snapshot:Trim(character)
+  check(
+    "snapshot/non-raid-maximum",
+    copiedNodeCount(record) <= 10000,
+    "non-raid data alone exceeds the cap"
+  )
+  local maximum = addon.Snapshot:Trim(buildMaxCharacter())
+  check(
+    "snapshot/non-raid-maximum",
+    #maximum.mythicplus.runHistory == 200
+      and #maximum.mythicplus.dungeons == 50
+      and #maximum.vault.activityEncounterInfo == 100
+      and #maximum.currencies == 100
+      and #maximum.equipment == 20,
+    "the cap cut non-raid data"
+  )
+end
+
+local function test_snapshot_fingerprint_checks_content()
+  check(
+    "snapshot/fingerprint-input",
+    not pcall(addon.Snapshot.Fingerprint, addon.Snapshot, nil),
+    "non-table input did not raise"
+  )
+  check(
+    "snapshot/fingerprint-input",
+    not pcall(addon.Snapshot.Fingerprint, addon.Snapshot, {GUID = "Player-1", callback = print}),
+    "record with a function did not raise"
+  )
+
+  local trimmed = addon.Snapshot:Trim(buildMaxCharacter())
+  local copy = addon.Util:CopySerializable(trimmed)
+  check(
+    "snapshot/fingerprint-plain-table",
+    addon.Snapshot:Fingerprint(copy) == addon.Snapshot:Fingerprint(trimmed),
+    "a plain copy of a trimmed record fingerprinted differently"
+  )
+
+  trimmed.info.onClick = print
+  local ok, message = pcall(addon.Snapshot.Fingerprint, addon.Snapshot, trimmed)
+  check(
+    "snapshot/fingerprint-mutated",
+    not ok and tostring(message):find("Snapshot:Fingerprint cannot serialize record", 1, true) ~= nil,
+    "a function added after Trim was not reported: " .. tostring(message)
+  )
+end
+
+local function lockout(name, expires, encounterIDs)
+  return {
+    id = 1,
+    name = name,
+    instanceID = 1,
+    difficultyID = 16,
+    expires = expires,
+    encounters = filled(#encounterIDs, function(index)
+      return {index = index, instanceEncounterID = encounterIDs[index], bossName = "Boss", isKilled = true}
+    end),
+  }
+end
+
+local function lockoutNames(record)
+  local names = {}
+  for index, instance in ipairs(record.raids.savedInstances) do
+    names[index] = instance.name
+  end
+  return table.concat(names, ",")
+end
+
+local function test_snapshot_drops_hidden_lockouts()
+  local character = AlterEgoDB.global.characters["Player-1"]
+  character.raids = {
+    savedInstances = {
+      lockout("expired-reset", 0, {3001, 3002}),
+      lockout("current", 2000, {3001, 3002}),
+      lockout("legacy", 2000, {0, 0, 0}),
+      lockout("expired-since-scan", 1000, {3001}),
+      lockout("current-name-mismatch", 2000, {3001, 0}),
+      lockout("no-encounters", 2000, {}),
+    },
+  }
+
+  local sent = addon.Snapshot:BuildOwn()["Player-1"]
+  check(
+    "snapshot/hidden-lockouts",
+    lockoutNames(sent) == "current,current-name-mismatch",
+    "sent lockouts were " .. lockoutNames(sent)
+  )
+  check("snapshot/hidden-lockouts", #character.raids.savedInstances == 6, "BuildOwn changed AlterEgo's data")
+
+  local received = addon.Snapshot:Trim(addon.Util:CopySerializable(sent))
+  check(
+    "snapshot/hidden-lockouts-receiver",
+    addon.Snapshot:SerializeStable(received) == addon.Snapshot:SerializeStable(sent)
+      and addon.Snapshot:Fingerprint(received) == addon.Snapshot:Fingerprint(sent)
+      and legacyFingerprint(received) == addon.Snapshot:Fingerprint(sent),
+    "a filtered record did not verify on new and 1.x receivers"
+  )
+
+  local legacySent = addon.Snapshot:Trim(character)
+  local legacyReceived = addon.Snapshot:Trim(addon.Util:CopySerializable(legacySent))
+  check(
+    "snapshot/hidden-lockouts-legacy-sender",
+    #legacyReceived.raids.savedInstances == 6
+      and addon.Snapshot:Fingerprint(legacyReceived) == legacyFingerprint(legacySent),
+    "a 1.x record with hidden lockouts failed to verify on a new receiver"
+  )
+
+  local manyHidden = filled(120, function() return lockout("legacy", 2000, {0}) end)
+  manyHidden[121] = lockout("current", 2000, {3001})
+  character.raids = {savedInstances = manyHidden}
+  check(
+    "snapshot/hidden-lockouts-limit",
+    lockoutNames(addon.Snapshot:BuildOwn()["Player-1"]) == "current",
+    "hidden lockouts used up Trim's 100-lockout limit"
+  )
+
+  character.raids = {}
+end
+
+-- Current lockouts sit last, where the cap cuts first; only the hidden ones push the
+-- record over 10,000 nodes, so filtering before the cap must leave real progress intact.
+local function test_snapshot_hidden_lockouts_filtered_before_cap()
+  local tenBosses = filled(10, function(index) return 3000 + index end)
+  local noBosses = filled(10, function() return 0 end)
+  local character = buildMaxCharacter()
+  character.GUID = "Player-Cap"
+  character.raids.savedInstances = filled(60, function() return lockout("legacy", 2000, noBosses) end)
+  for _ = 1, 3 do
+    table.insert(character.raids.savedInstances, lockout("current", 2000, tenBosses))
+  end
+
+  local unfiltered = addon.Snapshot:Trim(character)
+  check(
+    "snapshot/hidden-before-cap",
+    not lockoutNames(unfiltered):find("current"),
+    "fixture does not make the unfiltered cap drop the current lockouts"
+  )
+
+  AlterEgoDB.global.characters["Player-Cap"] = character
+  local sent = addon.Snapshot:BuildOwn()["Player-Cap"]
+  AlterEgoDB.global.characters["Player-Cap"] = nil
+  check(
+    "snapshot/hidden-before-cap",
+    lockoutNames(sent) == "current,current,current",
+    "sent lockouts were " .. lockoutNames(sent)
+  )
+  check(
+    "snapshot/hidden-before-cap",
+    #sent.mythicplus.runHistory == 200 and #sent.equipment == 20 and #sent.currencies == 100,
+    "the cap dropped data after hidden lockouts were filtered"
+  )
+  check(
+    "snapshot/hidden-before-cap",
+    addon.Snapshot:Fingerprint(sent) == legacyFingerprint(sent),
+    "filtered record fingerprints differently from 1.x"
+  )
+end
+
+-- Covers each way 1.1.1 Trim differs: it keeps the first 200 runs and the first
+-- 100 prey quests pairs() reaches, has no node cap, and keeps hidden lockouts.
+local function compatibilityCharacters()
+  local manyRuns = buildMaxCharacter()
+  manyRuns.GUID = "Player-Runs"
+  manyRuns.raids = {}
+  manyRuns.mythicplus.runHistory = filled(250, function(index)
+    return {thisWeek = index > 245, level = index, mapChallengeModeID = 1}
+  end)
+
+  local hiddenLockouts = buildMaxCharacter()
+  hiddenLockouts.GUID = "Player-Hidden"
+  hiddenLockouts.raids = {
+    savedInstances = {
+      lockout("expired", 0, {3001}),
+      lockout("legacy", 2000, {0, 0}),
+      lockout("current", 2000, {3001, 3002}),
+    },
+  }
+
+  return {
+    AlterEgoDB.global.characters["Player-1"],
+    buildMaxCharacter(),
+    manyRuns,
+    hiddenLockouts,
+    (buildRecordWithNodes(10000)),
+    (buildRecordWithNodes(10001)),
+  }
+end
+
+-- What a 1.1.1 receiver does with our DATA: Trim the record, then compare fingerprints.
+local function test_snapshot_verifies_on_1x_receiver()
+  for _, character in ipairs(compatibilityCharacters()) do
+    for _, hiddenLockoutsBefore in ipairs({false, 1000}) do
+      local sent = addon.Snapshot:Trim(character, hiddenLockoutsBefore or nil)
+      local received = LegacySnapshot:Trim(addon.Util:CopySerializable(sent))
+      check(
+        "snapshot/1x-receiver",
+        LegacySnapshot:Fingerprint(received) == addon.Snapshot:Fingerprint(sent),
+        character.GUID .. " (hidden lockouts " .. tostring(hiddenLockoutsBefore) .. ") failed to verify on 1.1.1"
+      )
+    end
+  end
+end
+
+-- 1.1.1 records over 10,000 nodes fingerprint a pairs()-order-dependent partial
+-- copy, so only records within the cap are expected to verify.
+local function test_snapshot_accepts_1x_sender()
+  local verified = 0
+  for _, character in ipairs(compatibilityCharacters()) do
+    local sent = LegacySnapshot:Trim(character)
+    if copiedNodeCount(sent) <= 10000 then
+      local received = addon.Snapshot:Trim(addon.Util:CopySerializable(sent))
+      check(
+        "snapshot/1x-sender",
+        addon.Snapshot:Fingerprint(received) == LegacySnapshot:Fingerprint(sent),
+        "a 1.1.1 record from " .. character.GUID .. " failed to verify"
+      )
+      verified = verified + 1
+    end
+  end
+  check("snapshot/1x-sender", verified >= 4, "only " .. verified .. " fixtures fit 1.1.1's node cap")
+end
+
 local function test_snapshot_excludes_injected()
   addon.db.injected["Player-1"] = "friend#1234"
   local excluded = addon.Snapshot:BuildOwn()
@@ -521,6 +981,18 @@ end
 test_snapshot_build_own()
 test_snapshot_trim_sanitizes()
 test_snapshot_fingerprint()
+test_snapshot_fingerprint_matches_legacy()
+test_snapshot_legacy_sender_verifies()
+test_snapshot_trim_cap_boundary()
+test_snapshot_trim_idempotent()
+test_snapshot_trim_deterministic()
+test_snapshot_fingerprint_checks_content()
+test_snapshot_run_history_keeps_newest()
+test_snapshot_non_raid_maximum_fits_cap()
+test_snapshot_drops_hidden_lockouts()
+test_snapshot_hidden_lockouts_filtered_before_cap()
+test_snapshot_verifies_on_1x_receiver()
+test_snapshot_accepts_1x_sender()
 test_snapshot_excludes_injected()
 
 test_injection_views()
