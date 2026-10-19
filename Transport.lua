@@ -152,6 +152,8 @@ function Transport:FramePayload(kind, payload, chunkSize)
 end
 
 -- Encode, frame, and queue a message to a peer over Battle.net or whisper.
+-- The body must be serialized before returning: Protocol shares one fingerprint
+-- table across every friend's INDEX, so queueing the table itself is unsafe.
 function Transport:Send(peer, kind, body, priority)
   if type(peer) ~= "table" then
     return false, "missing peer"

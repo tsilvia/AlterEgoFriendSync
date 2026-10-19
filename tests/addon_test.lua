@@ -974,6 +974,94 @@ local function test_protocol_flush_builds_once()
   check("protocol/flush-offline", buildOwnCalls == 0, "flush with only offline friends triggered BuildOwn")
 end
 
+local function sentToBothOnline()
+  table.sort(sentIndexTo)
+  return #sentIndexTo == 2 and sentIndexTo[1] == "online#1" and sentIndexTo[2] == "online#2"
+end
+
+local function test_protocol_broadcast_builds_once()
+  local protocol = addon.Protocol
+  lockedDown = false
+
+  resetProtocolCounters()
+  protocol:CheckForChanges(true)
+  check("protocol/check-changes", buildOwnCalls == 1, "CheckForChanges ran BuildOwn " .. buildOwnCalls .. " times")
+  check("protocol/check-changes", sentToBothOnline(), "CheckForChanges did not send INDEX to both online friends")
+
+  resetProtocolCounters()
+  protocol:SyncAll()
+  check("protocol/sync-all", buildOwnCalls == 1, "SyncAll ran BuildOwn " .. buildOwnCalls .. " times")
+  check("protocol/sync-all", sentToBothOnline(), "SyncAll did not send INDEX to both online friends")
+
+  resetProtocolCounters()
+  lockedDown = true
+  protocol:SyncAll()
+  check("protocol/sync-all-lockdown", buildOwnCalls == 0, "SyncAll during lockdown triggered BuildOwn")
+  lockedDown = false
+  protocol.pendingIndex = {}
+
+  resetProtocolCounters()
+  protocol.friendsByBattleTag["online#1"].online = false
+  protocol.friendsByBattleTag["online#2"].online = false
+  protocol:SyncAll()
+  check("protocol/sync-all-offline", buildOwnCalls == 0, "SyncAll with no friend online triggered BuildOwn")
+  protocol.friendsByBattleTag["online#1"].online = true
+  protocol.friendsByBattleTag["online#2"].online = true
+end
+
+local function test_protocol_sync_all_shares_refresh_build()
+  local protocol = addon.Protocol
+  local friends = {
+    {battleTag = "Online#1", game = {gameAccountID = 11, characterName = "One", realmName = "Realm"}},
+    {battleTag = "Online#2", game = {gameAccountID = 12, characterName = "Two", realmName = "Realm"}},
+    {battleTag = "Offline#3"},
+  }
+  local savedFriends = protocol.friendsByBattleTag
+  BNET_CLIENT_WOW = "WoW"
+  BNGetNumFriends = function() return #friends end
+  C_BattleNet.GetFriendAccountInfo = function(index)
+    return {battleTag = friends[index].battleTag, bnetAccountID = index}
+  end
+  C_BattleNet.GetFriendNumGameAccounts = function(index)
+    return friends[index].game and 1 or 0
+  end
+  C_BattleNet.GetFriendGameAccountInfo = function(index)
+    local game = friends[index].game
+    return {
+      isOnline = true,
+      clientProgram = "WoW",
+      wowProjectID = 1,
+      gameAccountID = game.gameAccountID,
+      characterName = game.characterName,
+      realmName = game.realmName,
+    }
+  end
+
+  -- online#2 was offline at the last refresh, so RefreshFriends sends it an
+  -- INDEX before SyncAll sends one to every online friend.
+  savedFriends["online#2"].online = false
+  lockedDown = false
+  resetProtocolCounters()
+  protocol:SyncAll()
+  check("protocol/sync-all-refresh", buildOwnCalls == 1, "SyncAll with a newly online friend ran BuildOwn " .. buildOwnCalls .. " times")
+  table.sort(sentIndexTo)
+  check(
+    "protocol/sync-all-refresh",
+    #sentIndexTo == 3 and sentIndexTo[1] == "online#1" and sentIndexTo[2] == "online#2" and sentIndexTo[3] == "online#2",
+    "SyncAll did not index the newly online friend from both RefreshFriends and SyncAll"
+  )
+
+  BNET_CLIENT_WOW = nil
+  BNGetNumFriends = nil
+  C_BattleNet.GetFriendAccountInfo = nil
+  C_BattleNet.GetFriendNumGameAccounts = nil
+  C_BattleNet.GetFriendGameAccountInfo = nil
+  savedFriends["online#2"].online = true
+  protocol.friendsByBattleTag = savedFriends
+  protocol.friendsByGameAccount = {}
+  protocol.friendsByCharacter = {}
+end
+
 --------------------------------------------------------------------------------
 -- Runner
 --------------------------------------------------------------------------------
@@ -1004,5 +1092,7 @@ test_transport_out_of_order_reassembly()
 setup_protocol()
 test_protocol_offline_not_queued()
 test_protocol_flush_builds_once()
+test_protocol_broadcast_builds_once()
+test_protocol_sync_all_shares_refresh_build()
 
 print("AlterEgoFriend data, transport, and protocol tests passed.")
