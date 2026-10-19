@@ -406,7 +406,8 @@ function Protocol:FlushPending()
 end
 
 -- Answers a peer's REQ by sending back the snapshots for the requested GUIDs,
--- capped at 200 records and queued at bulk priority.
+-- capped at 200 requested GUIDs and queued at bulk priority. Only the requested
+-- characters are built.
 function Protocol:SendRequestedData(peer, guids)
   if not peer.approved or type(guids) ~= "table" then
     return
@@ -414,17 +415,18 @@ function Protocol:SendRequestedData(peer, guids)
   if not self:GetOnlineRuntimePeer(peer) then
     return
   end
-  local records, fingerprints = Snapshot:BuildOwn()
-  local requestedRecords = {}
-  local requestedFingerprints = {}
-  local count = 0
+  local wanted = {}
+  local wantedCount = 0
   for _, guid in ipairs(guids) do
-    if records[guid] and count < 200 then
-      requestedRecords[guid] = records[guid]
-      requestedFingerprints[guid] = fingerprints[guid]
-      count = count + 1
+    if wantedCount >= 200 then
+      break
+    end
+    if type(guid) == "string" and not wanted[guid] then
+      wanted[guid] = true
+      wantedCount = wantedCount + 1
     end
   end
+  local requestedRecords, requestedFingerprints = Snapshot:BuildOwn(wanted)
   self:SendTo(peer, "DATA", {
     records = requestedRecords,
     fingerprints = requestedFingerprints,

@@ -459,7 +459,11 @@ function Snapshot:Fingerprint(record)
 end
 
 -- Build this player's shareable records and fingerprints, excluding injected friend characters.
-function Snapshot:BuildOwn()
+-- Pass wanted (a set of GUID => true, not an array) to build only those characters.
+function Snapshot:BuildOwn(wanted)
+  if wanted ~= nil and type(wanted) ~= "table" then
+    error("Snapshot:BuildOwn expects a GUID set or nil, got " .. type(wanted), 2)
+  end
   local characters = Util:GetAlterEgoCharacters()
   local records = {}
   local fingerprints = {}
@@ -472,7 +476,7 @@ function Snapshot:BuildOwn()
   -- AlterEgo stamps lockout expiry with time(), not server time.
   local now = time()
   for guid, character in pairs(characters) do
-    if not injected[guid] then
+    if not injected[guid] and (not wanted or wanted[guid]) then
       local record = self:Trim(character, now)
       if record then
         records[guid] = record

@@ -5,4 +5,5 @@ ignore:
   - .pkgmeta
   - .vscode
   - DEVELOPMENT.md
+  - package.json
   - tests
