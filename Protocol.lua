@@ -36,6 +36,20 @@ local function characterTarget(gameInfo)
   return (gameInfo.characterName .. "-" .. gameInfo.realmName):gsub("%s+", "")
 end
 
+-- Returns a getter that builds the local fingerprint map on first call and reuses
+-- it afterwards, so a broadcast costs at most one BuildOwn and none unless a send
+-- is attempted.
+local function lazyFingerprints()
+  local fingerprints
+  return function()
+    if not fingerprints then
+      local _
+      _, fingerprints = Snapshot:BuildOwn()
+    end
+    return fingerprints
+  end
+end
+
 -- Starts the periodic friend-refresh/change-check ticker and runs a first pass a
 -- few seconds after login, once the game APIs have settled.
 function Protocol:Initialize()
@@ -56,7 +70,8 @@ end
 
 -- Rebuilds the Battle.net friend lookup tables from the game's friend list and
 -- greets peers that just came online (or every online peer when announce is set).
-function Protocol:RefreshFriends(announce)
+-- An optional lazyFingerprints getter lets a caller share one build with its own sends.
+function Protocol:RefreshFriends(announce, fingerprints)
   if not BNGetNumFriends or not C_BattleNet then
     return
   end
@@ -139,12 +154,13 @@ function Protocol:RefreshFriends(announce)
   self.friendsByCharacter = byCharacter
 
   -- Hello newly-online peers (or all, if announcing); send friend-index to approved ones.
+  fingerprints = fingerprints or lazyFingerprints()
   for key, runtimePeer in pairs(byBattleTag) do
     if runtimePeer.online and (announce or not (previous[key] and previous[key].online)) then
       self:SendHello(runtimePeer)
       local peer = addon.db.peers[key]
       if peer and peer.approved then
-        self:SendIndex(peer)
+        self:SendIndex(peer, fingerprints)
       end
     end
   end
@@ -323,7 +339,9 @@ end
 
 -- Sends an approved friend the fingerprint of every local character so they can
 -- request only the records that changed; deferred during a chat lockdown.
--- Callers sending to several friends may pass one precomputed fingerprint map.
+-- Callers sending to several friends may pass one shared fingerprint map, or a
+-- getter from lazyFingerprints that is only invoked once a send will happen.
+-- Sharing a map is safe because Transport:Send serializes the body immediately.
 function Protocol:SendIndex(peer, fingerprints)
   if not peer or not peer.approved then
     return false, "friend is not approved"
@@ -338,7 +356,9 @@ function Protocol:SendIndex(peer, fingerprints)
     end
     return false, "addon chat is locked down"
   end
-  if not fingerprints then
+  if type(fingerprints) == "function" then
+    fingerprints = fingerprints()
+  elseif not fingerprints then
     local _
     _, fingerprints = Snapshot:BuildOwn()
   end
@@ -373,16 +393,9 @@ function Protocol:FlushPending()
   self.pendingIndex = {}
   -- Every queued friend gets the same fingerprint map, so build it at most once:
   -- rebuilding per friend inside this event handler trips "script ran too long".
-  local fingerprints
+  local fingerprints = lazyFingerprints()
   for key in pairs(index) do
-    local peer = addon.db.peers[key]
-    if peer and peer.approved and self:GetOnlineRuntimePeer(peer) then
-      if not fingerprints then
-        local _
-        _, fingerprints = Snapshot:BuildOwn()
-      end
-      self:SendIndex(peer, fingerprints)
-    end
+    self:SendIndex(addon.db.peers[key], fingerprints)
   end
 end
 
@@ -618,7 +631,7 @@ function Protocol:CheckForChanges(force)
   if changed then
     for _, peer in pairs(addon.db.peers) do
       if peer.approved then
-        self:SendIndex(peer)
+        self:SendIndex(peer, fingerprints)
       end
     end
   end
@@ -680,11 +693,12 @@ end
 -- Refreshes the friend list and asks every approved peer for their index while
 -- sending ours, forcing a full round of reconciliation.
 function Protocol:SyncAll()
-  self:RefreshFriends(false)
+  local fingerprints = lazyFingerprints()
+  self:RefreshFriends(false, fingerprints)
   for _, peer in pairs(addon.db.peers) do
     if peer.approved then
       self:SendTo(peer, "SYNC", {}, "NORMAL")
-      self:SendIndex(peer)
+      self:SendIndex(peer, fingerprints)
     end
   end
 end
