@@ -57,7 +57,7 @@ end
 -- few seconds after login, once the game APIs have settled.
 function Protocol:Initialize()
   self.periodicTicker = C_Timer.NewTicker(addon.db.settings.periodicSeconds or 60, function()
-    self:RefreshFriends(false)
+    self:RefreshFriends(false, true)
     -- A periodic INDEX also recovers from a dropped/expired multi-part DATA
     -- transfer even when the character data itself has not changed.
     self:CheckForChanges(true)
@@ -66,15 +66,17 @@ function Protocol:Initialize()
   end)
 
   C_Timer.After(5, function()
-    self:RefreshFriends(true)
+    self:RefreshFriends(true, true)
     self:CheckForChanges(true)
   end)
 end
 
 -- Rebuilds the Battle.net friend lookup tables from the game's friend list and
 -- greets peers that just came online (or every online peer when announce is set).
--- An optional lazyFingerprints getter lets a caller share one build with its own sends.
-function Protocol:RefreshFriends(announce, fingerprints)
+-- When skipIndex is set only HELLO is sent: the caller indexes every approved
+-- friend itself right afterwards (SyncAll, login pass, periodic tick).
+function Protocol:RefreshFriends(announce, skipIndex)
+  local fingerprints
   if not BNGetNumFriends or not C_BattleNet then
     return
   end
@@ -162,7 +164,7 @@ function Protocol:RefreshFriends(announce, fingerprints)
     if runtimePeer.online and (announce or not (previous[key] and previous[key].online)) then
       self:SendHello(runtimePeer)
       local peer = addon.db.peers[key]
-      if peer and peer.approved then
+      if peer and peer.approved and not skipIndex then
         self:SendIndex(peer, fingerprints)
       end
     end
@@ -609,7 +611,8 @@ end
 -- Compares fresh local fingerprints against the last known set and pushes an INDEX
 -- to every approved friend when a character changed (or when force is set).
 -- Returns before building when no approved friend is online: every send would
--- fail offline, and RefreshFriends already sends an INDEX when one comes online.
+-- fail offline, and a newly online friend is indexed by whichever broadcast runs next
+-- (or by RefreshFriends itself when called without skipIndex).
 -- lastLocalFingerprints stays stale until then, so the next non-forced check
 -- reports a change once.
 function Protocol:CheckForChanges(force)
@@ -713,7 +716,7 @@ end
 -- sending ours, forcing a full round of reconciliation.
 function Protocol:SyncAll()
   local fingerprints = lazyFingerprints()
-  self:RefreshFriends(false, fingerprints)
+  self:RefreshFriends(false, true)
   for _, peer in pairs(addon.db.peers) do
     if peer.approved then
       self:SendTo(peer, "SYNC", {}, "NORMAL")
