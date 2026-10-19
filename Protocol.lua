@@ -604,7 +604,22 @@ end
 
 -- Compares fresh local fingerprints against the last known set and pushes an INDEX
 -- to every approved friend when a character changed (or when force is set).
+-- Returns before building when no approved friend is online: every send would
+-- fail offline, and RefreshFriends already sends an INDEX when one comes online.
+-- lastLocalFingerprints stays stale until then, so the next non-forced check
+-- reports a change once.
 function Protocol:CheckForChanges(force)
+  local anyoneOnline = false
+  for _, peer in pairs(addon.db.peers) do
+    if peer.approved and self:GetOnlineRuntimePeer(peer) then
+      anyoneOnline = true
+      break
+    end
+  end
+  if not anyoneOnline then
+    return
+  end
+
   local _, fingerprints = Snapshot:BuildOwn()
   local changed = force == true
   if not changed then

@@ -1005,7 +1005,36 @@ local function test_protocol_broadcast_builds_once()
   protocol.friendsByBattleTag["online#2"].online = false
   protocol:SyncAll()
   check("protocol/sync-all-offline", buildOwnCalls == 0, "SyncAll with no friend online triggered BuildOwn")
+
+  resetProtocolCounters()
+  protocol.lastLocalFingerprints = {stale = "keep"}
+  protocol:CheckForChanges(true)
+  check("protocol/check-changes-offline", buildOwnCalls == 0, "CheckForChanges with no friend online triggered BuildOwn")
+  check("protocol/check-changes-offline", #sentIndexTo == 0, "CheckForChanges with no friend online sent an INDEX")
+  check(
+    "protocol/check-changes-offline",
+    protocol.lastLocalFingerprints.stale == "keep",
+    "offline check replaced stale fingerprints"
+  )
+
   protocol.friendsByBattleTag["online#1"].online = true
+  protocol.friendsByBattleTag["online#2"].online = true
+  resetProtocolCounters()
+  protocol:CheckForChanges()
+  check("protocol/check-changes-stale", buildOwnCalls == 1, "next check after friends return ran BuildOwn " .. buildOwnCalls .. " times")
+  check("protocol/check-changes-stale", sentToBothOnline(), "stale fingerprints did not send INDEX once a friend was online")
+
+  -- One approved friend online is enough to build and send. The offline approved
+  -- friends must not suppress that, and they must not receive an INDEX.
+  protocol.friendsByBattleTag["online#2"].online = false
+  resetProtocolCounters()
+  protocol:CheckForChanges(true)
+  check("protocol/check-changes-mixed", buildOwnCalls == 1, "CheckForChanges with one friend online ran BuildOwn " .. buildOwnCalls .. " times")
+  check(
+    "protocol/check-changes-mixed",
+    #sentIndexTo == 1 and sentIndexTo[1] == "online#1",
+    "CheckForChanges did not send INDEX only to the online friend"
+  )
   protocol.friendsByBattleTag["online#2"].online = true
 end
 
