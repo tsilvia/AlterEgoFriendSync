@@ -154,12 +154,20 @@ end
 -- Encode, frame, and queue a message to a peer over Battle.net or whisper.
 -- The body must be serialized before returning: Protocol shares one fingerprint
 -- table across every friend's INDEX, so queueing the table itself is unsafe.
-function Transport:Send(peer, kind, body, priority)
+-- An optional encodedCache table lets several sends of an identical body share
+-- one encoded payload; the first send fills it.
+function Transport:Send(peer, kind, body, priority, encodedCache)
   if type(peer) ~= "table" then
     return false, "missing peer"
   end
 
-  local payload = self:EncodeEnvelope(kind, body)
+  local payload = encodedCache and encodedCache[kind]
+  if not payload then
+    payload = self:EncodeEnvelope(kind, body)
+    if encodedCache then
+      encodedCache[kind] = payload
+    end
+  end
   if #payload > MAX_TRANSFER_BYTES then
     return false, "payload is too large"
   end

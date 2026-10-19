@@ -884,6 +884,29 @@ local function test_transport_out_of_order_reassembly()
   )
 end
 
+local function test_transport_shared_encode_cache()
+  local transport = addon.Transport
+  local encodeCalls = 0
+  local realEncode = transport.EncodeEnvelope
+  transport.EncodeEnvelope = function(...)
+    encodeCalls = encodeCalls + 1
+    return realEncode(...)
+  end
+
+  local cache = {}
+  local body = {value = "same"}
+  assert(transport:Send({gameAccountID = 1}, "INDEX", body, "NORMAL", cache))
+  assert(transport:Send({gameAccountID = 2}, "INDEX", body, "NORMAL", cache))
+  check("transport/encode-cache", encodeCalls == 1, "shared cache encoded " .. encodeCalls .. " times")
+
+  encodeCalls = 0
+  assert(transport:Send({gameAccountID = 1}, "INDEX", body, "NORMAL"))
+  assert(transport:Send({gameAccountID = 2}, "INDEX", body, "NORMAL"))
+  check("transport/encode-cache", encodeCalls == 2, "uncached sends should each encode")
+
+  transport.EncodeEnvelope = realEncode
+end
+
 --------------------------------------------------------------------------------
 -- Protocol
 --------------------------------------------------------------------------------
@@ -891,6 +914,7 @@ end
 local lockedDown = false
 local buildOwnCalls = 0
 local sentIndexTo = {}
+local sentIndexCaches = {}
 
 local function setup_protocol()
   C_ChatInfo.InChatMessagingLockdown = function() return lockedDown end
@@ -901,9 +925,10 @@ local function setup_protocol()
     buildOwnCalls = buildOwnCalls + 1
     return buildOwn(...)
   end
-  addon.Transport.Send = function(_, runtimePeer, kind)
+  addon.Transport.Send = function(_, runtimePeer, kind, _body, _priority, encodedCache)
     if kind == "INDEX" then
       sentIndexTo[#sentIndexTo + 1] = runtimePeer.key
+      sentIndexCaches[#sentIndexCaches + 1] = encodedCache
     end
     return true
   end
@@ -924,6 +949,24 @@ end
 local function resetProtocolCounters()
   buildOwnCalls = 0
   sentIndexTo = {}
+  sentIndexCaches = {}
+end
+
+local function test_protocol_batch_shares_encode_cache()
+  local protocol = addon.Protocol
+  resetProtocolCounters()
+  lockedDown = false
+  protocol.pendingIndex = {["online#1"] = true, ["online#2"] = true}
+  protocol:FlushPending()
+  check(
+    "protocol/encode-cache",
+    #sentIndexCaches == 2 and sentIndexCaches[1] ~= nil and sentIndexCaches[1] == sentIndexCaches[2],
+    "friends in one batch did not share an encode cache"
+  )
+
+  resetProtocolCounters()
+  protocol:SendIndex(addon.db.peers["online#1"])
+  check("protocol/encode-cache", sentIndexCaches[1] == nil, "one-off send should not use a cache")
 end
 
 local function test_protocol_offline_not_queued()
@@ -1117,9 +1160,11 @@ test_injection_views()
 setup_transport()
 test_serializer_round_trip()
 test_transport_out_of_order_reassembly()
+test_transport_shared_encode_cache()
 
 setup_protocol()
 test_protocol_offline_not_queued()
+test_protocol_batch_shares_encode_cache()
 test_protocol_flush_builds_once()
 test_protocol_broadcast_builds_once()
 test_protocol_sync_all_shares_refresh_build()
