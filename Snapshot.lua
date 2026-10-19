@@ -47,6 +47,22 @@ local function boundedArray(source, maximum, mapper)
   return result
 end
 
+-- Like boundedArray, but keeps the last `maximum` entries. With `maximum` or fewer
+-- entries both keep everything, so 1.x receivers leave the result unchanged.
+local function newestBoundedArray(source, maximum, mapper)
+  local result = {}
+  if type(source) ~= "table" then
+    return result
+  end
+  for index = math.max(1, #source - maximum + 1), #source do
+    local mapped = mapper(source[index])
+    if mapped then
+      result[#result + 1] = mapped
+    end
+  end
+  return result
+end
+
 local function trimInfo(sourceInfo)
   sourceInfo = tableOrEmpty(sourceInfo)
   local sourceRace = tableOrEmpty(sourceInfo.race)
@@ -98,7 +114,8 @@ local function trimMythicplus(sourceMythic)
       itemId = number(sourceKeystone.itemId),
       itemLink = text(sourceKeystone.itemLink),
     },
-    runHistory = boundedArray(sourceMythic.runHistory, 200, function(run)
+    -- C_MythicPlus.GetRunHistory lists oldest first; this week's runs drive the vault display.
+    runHistory = newestBoundedArray(sourceMythic.runHistory, 200, function(run)
       if type(run) ~= "table" then return nil end
       return {
         thisWeek = run.thisWeek == true,
@@ -191,15 +208,68 @@ local function trimCurrencies(sourceCurrencies)
   end)
 end
 
+local MAX_PREY_QUESTS = 100
+
+local function heapSwap(heap, a, b)
+  heap[a], heap[b] = heap[b], heap[a]
+end
+
+-- Max-heap of quest IDs: heap[1] is always the largest kept ID.
+local function heapPush(heap, value)
+  heap[#heap + 1] = value
+  local index = #heap
+  while index > 1 do
+    local parent = math.floor(index / 2)
+    if heap[parent] >= heap[index] then
+      return
+    end
+    heapSwap(heap, parent, index)
+    index = parent
+  end
+end
+
+local function heapReplaceTop(heap, value)
+  heap[1] = value
+  local index = 1
+  while true do
+    local largest = index
+    local left, right = index * 2, index * 2 + 1
+    if heap[left] and heap[left] > heap[largest] then largest = left end
+    if heap[right] and heap[right] > heap[largest] then largest = right end
+    if largest == index then
+      return
+    end
+    heapSwap(heap, index, largest)
+    index = largest
+  end
+end
+
+-- Keeps the 100 lowest quest IDs so the same data always trims to the same record.
+-- Holds at most 100 IDs while scanning, so a huge quest table is never copied or sorted.
 local function trimPrey(sourcePrey)
-  local questsCompleted = {}
-  local count = 0
+  local completedByID = {}
+  local kept = {}
   for questID, completed in pairs(tableOrEmpty(tableOrEmpty(sourcePrey).questsCompleted)) do
     local sanitizedID = number(questID)
-    if sanitizedID > 0 and type(completed) == "boolean" and count < 100 then
-      questsCompleted[sanitizedID] = completed
-      count = count + 1
+    if sanitizedID > 0 and type(completed) == "boolean" then
+      if completedByID[sanitizedID] ~= nil then
+        -- "91001" and 91001 sanitize to the same ID; true wins regardless of pairs() order.
+        completedByID[sanitizedID] = completedByID[sanitizedID] or completed
+      elseif #kept < MAX_PREY_QUESTS then
+        heapPush(kept, sanitizedID)
+        completedByID[sanitizedID] = completed
+      elseif sanitizedID < kept[1] then
+        -- The largest kept ID only shrinks, so an evicted ID can never come back.
+        completedByID[kept[1]] = nil
+        heapReplaceTop(kept, sanitizedID)
+        completedByID[sanitizedID] = completed
+      end
     end
+  end
+
+  local questsCompleted = {}
+  for _, questID in ipairs(kept) do
+    questsCompleted[questID] = completedByID[questID]
   end
   return {questsCompleted = questsCompleted}
 end
@@ -235,40 +305,103 @@ local function trimEquipment(sourceEquipment)
   end)
 end
 
--- Extract and santize raid data
-local function trimRaids(sourceRaids)
-  sourceRaids = tableOrEmpty(sourceRaids)
+-- AlterEgo only displays unexpired lockouts of current-season raids, and stores
+-- instanceEncounterID = 0 for every encounter of a raid outside that list. A single
+-- zero can be a boss-name mismatch inside a current raid, so all must be zero.
+local function isHiddenLockout(instance, now)
+  if type(instance) ~= "table" or number(instance.expires) <= now then
+    return true
+  end
+  local encounters = tableOrEmpty(instance.encounters)
+  for index = 1, math.min(#encounters, 100) do
+    local encounter = encounters[index]
+    if type(encounter) == "table" and number(encounter.instanceEncounterID) ~= 0 then
+      return false
+    end
+  end
+  return true
+end
+
+-- 1.x clients fingerprint through Util:CopySerializable, which silently stops
+-- copying after 10,000 nodes. This must equal that limit: lower would reject 1.x
+-- records that verify today, higher would hash differently on 1.x receivers.
+local MAX_RECORD_NODES = 10000
+
+-- Counts every key at every depth, the same way Util:CopySerializable charges its limit.
+local function countNodes(value)
+  local count = 0
+  for _, child in pairs(value) do
+    count = count + 1
+    if type(child) == "table" then
+      count = count + countNodes(child)
+    end
+  end
+  return count
+end
+
+local function trimLockout(instance)
   return {
-    savedInstances = boundedArray(sourceRaids.savedInstances, 100, function(instance)
-      if type(instance) ~= "table" then return nil end
+    id = number(instance.id),
+    name = text(instance.name),
+    instanceID = number(instance.instanceID),
+    difficultyID = number(instance.difficultyID),
+    expires = number(instance.expires),
+    encounters = boundedArray(instance.encounters, 100, function(encounter)
+      if type(encounter) ~= "table" then return nil end
       return {
-        id = number(instance.id),
-        name = text(instance.name),
-        instanceID = number(instance.instanceID),
-        difficultyID = number(instance.difficultyID),
-        expires = number(instance.expires),
-        encounters = boundedArray(instance.encounters, 100, function(encounter)
-          if type(encounter) ~= "table" then return nil end
-          return {
-            index = number(encounter.index),
-            instanceEncounterID = number(encounter.instanceEncounterID),
-            bossName = text(encounter.bossName),
-            fileDataID = number(encounter.fileDataID),
-            isKilled = encounter.isKilled == true,
-          }
-        end),
+        index = number(encounter.index),
+        instanceEncounterID = number(encounter.instanceEncounterID),
+        bossName = text(encounter.bossName),
+        fileDataID = number(encounter.fileDataID),
+        isKilled = encounter.isKilled == true,
       }
     end),
   }
 end
 
+-- Builds raid lockouts in order until the next one would exceed `budget` nodes.
+-- Everything else at its Trim limits stays under MAX_RECORD_NODES, so lockouts are
+-- the only overflow. Stopping at the first misfit, rather than skipping it, keeps
+-- the result a prefix that 1.x Trim leaves as-is.
+-- Receivers keep the first 100 source entries; own records skip hidden lockouts
+-- first and keep the first 100 visible ones.
+local function trimLockouts(sourceRaids, hiddenLockoutsBefore, budget)
+  local lockouts = {}
+  local savedInstances = tableOrEmpty(sourceRaids).savedInstances
+  if type(savedInstances) ~= "table" then
+    return lockouts
+  end
+  for index = 1, #savedInstances do
+    if not hiddenLockoutsBefore and index > 100 then
+      break
+    end
+    local instance = savedInstances[index]
+    local hidden = hiddenLockoutsBefore and isHiddenLockout(instance, hiddenLockoutsBefore)
+    if not hidden and type(instance) == "table" then
+      local lockout = trimLockout(instance)
+      local cost = 1 + countNodes(lockout)
+      if cost > budget then
+        break
+      end
+      budget = budget - cost
+      lockouts[#lockouts + 1] = lockout
+      if #lockouts == 100 then
+        break
+      end
+    end
+  end
+  return lockouts
+end
+
 -- Sanitize a character into a shareable record with typed fields and bounded arrays.
-function Snapshot:Trim(character)
+-- Pass hiddenLockoutsBefore (a time() timestamp) only when building our own records:
+-- receivers must not drop lockouts, or records from 1.x senders would stop verifying.
+function Snapshot:Trim(character, hiddenLockoutsBefore)
   if type(character) ~= "table" or type(character.GUID) ~= "string" or character.GUID == "" then
     return nil
   end
 
-  return {
+  local record = {
     GUID = character.GUID,
     lastUpdate = number(character.lastUpdate),
     currentSeason = number(character.currentSeason),
@@ -278,7 +411,7 @@ function Snapshot:Trim(character)
     info = trimInfo(character.info),
     mythicplus = trimMythicplus(character.mythicplus),
     vault = trimVault(character.vault),
-    raids = trimRaids(character.raids),
+    raids = {savedInstances = {}},
     currencies = trimCurrencies(character.currencies),
     prey = trimPrey(character.prey),
     equipment = trimEquipment(character.equipment),
@@ -286,6 +419,12 @@ function Snapshot:Trim(character)
     -- Money remains local-only.
     money = 0,
   }
+  record.raids.savedInstances = trimLockouts(
+    character.raids,
+    hiddenLockoutsBefore,
+    MAX_RECORD_NODES - countNodes(record)
+  )
+  return record
 end
 
 -- Serialize with stable key order so identical tables always produce the same bytes.
@@ -296,16 +435,26 @@ function Snapshot:SerializeStable(value)
   }, value)
 end
 
+-- These are local presentation/activity fields. AlterEgo rewrites order while
+-- rendering and touches lastUpdate for unrelated events, so including either
+-- would create false network updates.
+local FINGERPRINT_EXCLUDED = {order = true, enabled = true, lastUpdate = true}
+
 -- Content hash of a record, ignoring local presentation fields that would cause false updates.
 function Snapshot:Fingerprint(record)
-  local fingerprintRecord = Util:CopySerializable(record)
-  -- These are local presentation/activity fields. AlterEgo rewrites order while
-  -- rendering and touches lastUpdate for unrelated events, so including either
-  -- would create false network updates.
-  fingerprintRecord.order = nil
-  fingerprintRecord.enabled = nil
-  fingerprintRecord.lastUpdate = nil
-  local serialized = self:SerializeStable(fingerprintRecord)
+  if type(record) ~= "table" then
+    error("Snapshot:Fingerprint expects a table, got " .. type(record), 2)
+  end
+  local fingerprintRecord = {}
+  for key, value in pairs(record) do
+    if not FINGERPRINT_EXCLUDED[key] then
+      fingerprintRecord[key] = value
+    end
+  end
+  local ok, serialized = pcall(self.SerializeStable, self, fingerprintRecord)
+  if not ok then
+    error("Snapshot:Fingerprint cannot serialize record: " .. tostring(serialized), 2)
+  end
   return tostring(LibDeflate:Adler32(serialized)) .. ":" .. tostring(#serialized)
 end
 
@@ -320,9 +469,11 @@ function Snapshot:BuildOwn()
 
   -- Snapshot each owned character; skip friend-injected rows so we do not re-share them.
   local injected = addon.db and addon.db.injected or {}
+  -- AlterEgo stamps lockout expiry with time(), not server time.
+  local now = time()
   for guid, character in pairs(characters) do
     if not injected[guid] then
-      local record = self:Trim(character)
+      local record = self:Trim(character, now)
       if record then
         records[guid] = record
         fingerprints[guid] = self:Fingerprint(record)
