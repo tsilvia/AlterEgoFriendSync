@@ -41,12 +41,15 @@ end
 -- is attempted.
 local function lazyFingerprints()
   local fingerprints
+  -- Second return is a table where Transport caches the encoded INDEX payload,
+  -- so one broadcast encodes and compresses it once for all friends.
+  local encodedCache = {}
   return function()
     if not fingerprints then
       local _
       _, fingerprints = Snapshot:BuildOwn()
     end
-    return fingerprints
+    return fingerprints, encodedCache
   end
 end
 
@@ -302,7 +305,7 @@ end
 
 -- Hands a message to the transport for either a stored or runtime peer, failing
 -- fast when that friend is not currently online.
-function Protocol:SendTo(peerOrRuntime, kind, body, priority)
+function Protocol:SendTo(peerOrRuntime, kind, body, priority, encodedCache)
   if type(peerOrRuntime) ~= "table" then
     return false, "missing peer"
   end
@@ -310,7 +313,7 @@ function Protocol:SendTo(peerOrRuntime, kind, body, priority)
   if not runtimePeer then
     return false, "friend is offline"
   end
-  return Transport:Send(runtimePeer, kind, body, priority)
+  return Transport:Send(runtimePeer, kind, body, priority, encodedCache)
 end
 
 -- Announces this addon's version info to every game account a friend is logged in
@@ -356,8 +359,9 @@ function Protocol:SendIndex(peer, fingerprints)
     end
     return false, "addon chat is locked down"
   end
+  local encodedCache
   if type(fingerprints) == "function" then
-    fingerprints = fingerprints()
+    fingerprints, encodedCache = fingerprints()
   elseif not fingerprints then
     local _
     _, fingerprints = Snapshot:BuildOwn()
@@ -366,7 +370,7 @@ function Protocol:SendIndex(peer, fingerprints)
     fingerprints = fingerprints,
     alterEgoVersion = Util:GetAlterEgoVersion(),
     alterEgoDBVersion = Util:GetAlterEgoDBVersion(),
-  }, "NORMAL")
+  }, "NORMAL", encodedCache)
   if sent and key then
     self.pendingIndex[key] = nil
   end
