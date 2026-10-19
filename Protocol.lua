@@ -271,14 +271,27 @@ function Protocol:GetRuntimePeer(peer)
   return aggregate
 end
 
+-- Resolves a stored or runtime peer to its live friend entry, or nil when that
+-- friend is not currently online.
+function Protocol:GetOnlineRuntimePeer(peerOrRuntime)
+  if type(peerOrRuntime) ~= "table" then
+    return nil
+  end
+  local runtimePeer = peerOrRuntime.gameAccountID and peerOrRuntime or self:GetRuntimePeer(peerOrRuntime)
+  if not runtimePeer or not runtimePeer.online then
+    return nil
+  end
+  return runtimePeer
+end
+
 -- Hands a message to the transport for either a stored or runtime peer, failing
 -- fast when that friend is not currently online.
 function Protocol:SendTo(peerOrRuntime, kind, body, priority)
   if type(peerOrRuntime) ~= "table" then
     return false, "missing peer"
   end
-  local runtimePeer = peerOrRuntime.gameAccountID and peerOrRuntime or self:GetRuntimePeer(peerOrRuntime)
-  if not runtimePeer or not runtimePeer.online then
+  local runtimePeer = self:GetOnlineRuntimePeer(peerOrRuntime)
+  if not runtimePeer then
     return false, "friend is offline"
   end
   return Transport:Send(runtimePeer, kind, body, priority)
@@ -310,18 +323,25 @@ end
 
 -- Sends an approved friend the fingerprint of every local character so they can
 -- request only the records that changed; deferred during a chat lockdown.
-function Protocol:SendIndex(peer)
+-- Callers sending to several friends may pass one precomputed fingerprint map.
+function Protocol:SendIndex(peer, fingerprints)
   if not peer or not peer.approved then
     return false, "friend is not approved"
   end
   local key = peer.key or Util:NormalizeBattleTag(peer.battleTag)
+  if not self:GetOnlineRuntimePeer(peer) then
+    return false, "friend is offline"
+  end
   if Transport:IsLockedDown() then
     if key then
       self.pendingIndex[key] = true
     end
     return false, "addon chat is locked down"
   end
-  local _, fingerprints = Snapshot:BuildOwn()
+  if not fingerprints then
+    local _
+    _, fingerprints = Snapshot:BuildOwn()
+  end
   local sent, err = self:SendTo(peer, "INDEX", {
     fingerprints = fingerprints,
     alterEgoVersion = Util:GetAlterEgoVersion(),
@@ -351,10 +371,17 @@ function Protocol:FlushPending()
 
   local index = self.pendingIndex
   self.pendingIndex = {}
+  -- Every queued friend gets the same fingerprint map, so build it at most once:
+  -- rebuilding per friend inside this event handler trips "script ran too long".
+  local fingerprints
   for key in pairs(index) do
     local peer = addon.db.peers[key]
-    if peer and peer.approved then
-      self:SendIndex(peer)
+    if peer and peer.approved and self:GetOnlineRuntimePeer(peer) then
+      if not fingerprints then
+        local _
+        _, fingerprints = Snapshot:BuildOwn()
+      end
+      self:SendIndex(peer, fingerprints)
     end
   end
 end
@@ -363,6 +390,9 @@ end
 -- capped at 200 records and queued at bulk priority.
 function Protocol:SendRequestedData(peer, guids)
   if not peer.approved or type(guids) ~= "table" then
+    return
+  end
+  if not self:GetOnlineRuntimePeer(peer) then
     return
   end
   local records, fingerprints = Snapshot:BuildOwn()

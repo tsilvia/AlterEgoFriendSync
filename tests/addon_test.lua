@@ -425,6 +425,96 @@ local function test_transport_out_of_order_reassembly()
 end
 
 --------------------------------------------------------------------------------
+-- Protocol
+--------------------------------------------------------------------------------
+
+local lockedDown = false
+local buildOwnCalls = 0
+local sentIndexTo = {}
+
+local function setup_protocol()
+  C_ChatInfo.InChatMessagingLockdown = function() return lockedDown end
+  loadModule("Protocol.lua")
+
+  local buildOwn = addon.Snapshot.BuildOwn
+  addon.Snapshot.BuildOwn = function(...)
+    buildOwnCalls = buildOwnCalls + 1
+    return buildOwn(...)
+  end
+  addon.Transport.Send = function(_, runtimePeer, kind)
+    if kind == "INDEX" then
+      sentIndexTo[#sentIndexTo + 1] = runtimePeer.key
+    end
+    return true
+  end
+
+  local protocol = addon.Protocol
+  addon.db.peers = {
+    ["online#1"] = {key = "online#1", battleTag = "Online#1", approved = true},
+    ["online#2"] = {key = "online#2", battleTag = "Online#2", approved = true},
+    ["offline#3"] = {key = "offline#3", battleTag = "Offline#3", approved = true},
+  }
+  protocol.friendsByBattleTag = {
+    ["online#1"] = {key = "online#1", online = true, gameAccountID = 11},
+    ["online#2"] = {key = "online#2", online = true, gameAccountID = 12},
+    ["offline#3"] = {key = "offline#3", online = false},
+  }
+end
+
+local function resetProtocolCounters()
+  buildOwnCalls = 0
+  sentIndexTo = {}
+end
+
+local function test_protocol_offline_not_queued()
+  local protocol = addon.Protocol
+  resetProtocolCounters()
+  lockedDown = true
+  local sent, err = protocol:SendIndex(addon.db.peers["offline#3"])
+  check("protocol/offline-queue", not sent and err == "friend is offline", "offline friend was not rejected")
+  check("protocol/offline-queue", not protocol.pendingIndex["offline#3"], "offline friend was queued during lockdown")
+  check("protocol/offline-queue", buildOwnCalls == 0, "offline friend triggered BuildOwn")
+
+  lockedDown = false
+  protocol:SendRequestedData(addon.db.peers["offline#3"], {"Player-1"})
+  check("protocol/offline-data", buildOwnCalls == 0, "offline data request triggered BuildOwn")
+end
+
+local function test_protocol_flush_builds_once()
+  local protocol = addon.Protocol
+  resetProtocolCounters()
+  protocol.pendingIndex = {}
+  lockedDown = true
+  for _, peer in pairs(addon.db.peers) do
+    protocol:SendIndex(peer)
+  end
+  check(
+    "protocol/lockdown-queue",
+    protocol.pendingIndex["online#1"] and protocol.pendingIndex["online#2"] and not protocol.pendingIndex["offline#3"],
+    "lockdown did not queue exactly the online friends"
+  )
+  check("protocol/lockdown-queue", buildOwnCalls == 0, "queuing during lockdown triggered BuildOwn")
+
+  -- A friend who logs off mid-lockdown is skipped at flush time.
+  protocol.friendsByBattleTag["online#2"].online = false
+  lockedDown = false
+  protocol:FlushPending()
+  check("protocol/flush", buildOwnCalls == 1, "flush ran BuildOwn " .. buildOwnCalls .. " times")
+  check(
+    "protocol/flush",
+    #sentIndexTo == 1 and sentIndexTo[1] == "online#1",
+    "flush did not send INDEX to only the online friend"
+  )
+  check("protocol/flush", next(protocol.pendingIndex) == nil, "flush left friends queued")
+  protocol.friendsByBattleTag["online#2"].online = true
+
+  resetProtocolCounters()
+  protocol.pendingIndex = {["offline#3"] = true}
+  protocol:FlushPending()
+  check("protocol/flush-offline", buildOwnCalls == 0, "flush with only offline friends triggered BuildOwn")
+end
+
+--------------------------------------------------------------------------------
 -- Runner
 --------------------------------------------------------------------------------
 
@@ -439,4 +529,8 @@ setup_transport()
 test_serializer_round_trip()
 test_transport_out_of_order_reassembly()
 
-print("AlterEgoFriend data and transport tests passed.")
+setup_protocol()
+test_protocol_offline_not_queued()
+test_protocol_flush_builds_once()
+
+print("AlterEgoFriend data, transport, and protocol tests passed.")
