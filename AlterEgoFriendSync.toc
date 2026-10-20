@@ -1,8 +1,8 @@
-## Interface: 120100
+## Interface: 120105
 ## Title: AlterEgo Friend Sync
 ## Notes: Friends can opt-in to your character progress for AlterEgo
 ## Author: Toddish
-## Version: 1.1.0
+## Version: 1.1.1
 ## Dependencies: AlterEgo
 ## SavedVariables: AlterEgoFriendSyncDB
 
