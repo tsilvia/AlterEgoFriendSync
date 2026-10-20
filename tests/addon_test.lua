@@ -1276,4 +1276,40 @@ test_protocol_broadcast_builds_once()
 test_protocol_sync_all_shares_refresh_build()
 test_protocol_requested_data_builds_only_requested()
 
+local function test_protocol_two_clients_reply_to_sender()
+  local protocol = addon.Protocol
+  local saved = {
+    protocol.friendsByBattleTag, protocol.friendsByGameAccount, protocol.friendsByCharacter,
+    protocol.Dispatch,
+  }
+  local a = { key = "two#1", battleTag = "Two#1", displayName = "Two#1", gameAccountID = 1, online = true }
+  local b = { key = "two#1", battleTag = "Two#1", displayName = "Two#1", gameAccountID = 2, online = true }
+  protocol.friendsByBattleTag = { ["two#1"] = a }
+  protocol.friendsByGameAccount = { ["1"] = a, ["2"] = b }
+  protocol.friendsByCharacter = {}
+  addon.db.peers["two#1"] = { approved = true, snapshots = {}, fingerprints = {}, preferredGameAccountID = 1 }
+  local peer = addon.db.peers["two#1"]
+
+  local replyTarget
+  protocol.Dispatch = function(self, p)
+    replyTarget = self:GetRuntimePeer(p).gameAccountID
+  end
+  protocol:Receive("BNET", 2, { kind = "SYNC", body = {} })
+  check("protocol/two-clients", replyTarget == 2, "reply did not go to the sending client")
+  check("protocol/two-clients", peer.preferredGameAccountID == 1, "preferred account flipped on inbound frame")
+  check("protocol/two-clients", peer.replyGameAccountID == nil, "replyGameAccountID leaked after dispatch")
+
+  protocol.Dispatch = function() error("boom") end
+  local handler = geterrorhandler
+  geterrorhandler = function() return function() end end
+  protocol:Receive("BNET", 2, { kind = "SYNC", body = {} })
+  geterrorhandler = handler
+  check("protocol/two-clients", peer.replyGameAccountID == nil, "replyGameAccountID leaked after handler error")
+
+  addon.db.peers["two#1"] = nil
+  protocol.friendsByBattleTag, protocol.friendsByGameAccount, protocol.friendsByCharacter, protocol.Dispatch =
+    saved[1], saved[2], saved[3], saved[4]
+end
+test_protocol_two_clients_reply_to_sender()
+
 print("AlterEgoFriend data, transport, and protocol tests passed.")

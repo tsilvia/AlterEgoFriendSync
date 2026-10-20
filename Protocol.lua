@@ -198,7 +198,8 @@ function Protocol:ResolveSender(sourceType, sourceID)
       local gameOK, gameInfo = pcall(C_BattleNet.GetGameAccountInfoByID, sourceID)
       if gameOK and type(gameInfo) == "table" and gameInfo.playerGuid then
         local accountOK, accountInfo = pcall(C_BattleNet.GetAccountInfoByGUID, gameInfo.playerGuid)
-        if accountOK and type(accountInfo) == "table" and accountInfo.isFriend then
+        -- Non-retail (Classic, etc.) accounts are never cached or replied to.
+        if accountOK and type(accountInfo) == "table" and accountInfo.isFriend and isRetailWow(gameInfo) then
           local key = Util:NormalizeBattleTag(accountInfo.battleTag)
           if key then
             local runtimePeer = {
@@ -268,8 +269,14 @@ function Protocol:GetStoredPeer(runtimePeer, create)
     peer.displayName = runtimePeer.displayName
     peer.snapshots = type(peer.snapshots) == "table" and peer.snapshots or {}
     peer.fingerprints = type(peer.fingerprints) == "table" and peer.fingerprints or {}
-    if runtimePeer.gameAccountID then
-      peer.preferredGameAccountID = runtimePeer.gameAccountID
+    -- Only adopt a game account when none is stored or the stored one is gone, so
+    -- a friend on two clients doesn't flip the preferred account on every frame.
+    if runtimePeer.gameAccountID and runtimePeer.online then
+      local current = peer.preferredGameAccountID
+      local live = current and self.friendsByGameAccount[tostring(current)]
+      if not live or live.key ~= runtimePeer.key or not live.online then
+        peer.preferredGameAccountID = runtimePeer.gameAccountID
+      end
     end
   end
   return peer
@@ -283,6 +290,13 @@ function Protocol:GetRuntimePeer(peer)
   end
   local key = peer.key or Util:NormalizeBattleTag(peer.battleTag)
   local aggregate = key and self.friendsByBattleTag[key] or nil
+  -- While handling an inbound frame, replies go back to the client that sent it.
+  if aggregate and peer.replyGameAccountID then
+    local sender = self.friendsByGameAccount[tostring(peer.replyGameAccountID)]
+    if sender and sender.key == key then
+      return sender
+    end
+  end
   if aggregate and peer.preferredGameAccountID then
     local preferred = self.friendsByGameAccount[tostring(peer.preferredGameAccountID)]
     if preferred and preferred.key == key then
@@ -447,6 +461,15 @@ function Protocol:Receive(sourceType, sourceID, envelope)
     return
   end
 
+  peer.replyGameAccountID = runtimePeer.gameAccountID
+  local ok, err = xpcall(self.Dispatch, geterrorhandler and geterrorhandler() or print, self, peer, envelope)
+  peer.replyGameAccountID = nil
+  if not ok then
+    return
+  end
+end
+
+function Protocol:Dispatch(peer, envelope)
   if envelope.kind == "HELLO" then
     self:ReceiveHello(peer, envelope.body)
     return
